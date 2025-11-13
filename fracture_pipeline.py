@@ -10,7 +10,7 @@ class FracturePipeline:
     def __init__(self, model_path, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Mismas transformaciones que en el entrenamiento
+        # Transformaciones (idénticas a las del entrenamiento)
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -28,8 +28,47 @@ class FracturePipeline:
 
         self.classes = ['fractured', 'not fractured']
 
+    # ==============================================================
+    # 🧼 LIMPIEZA DE LA RADIOGRAFÍA (solo huesos)
+    # ==============================================================
+    def _preprocess_bones(self, image_path):
+        """Limpia la radiografía para dejar solo los huesos visibles."""
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+        # 1️⃣ Aumentar contraste
+        img_eq = cv2.equalizeHist(img)
+
+        # 2️⃣ Reducir ruido pero mantener bordes
+        img_blur = cv2.bilateralFilter(img_eq, d=9, sigmaColor=75, sigmaSpace=75)
+
+        # 3️⃣ Umbral adaptativo para destacar huesos (zonas blancas)
+        _, thresh = cv2.threshold(img_blur, 130, 255, cv2.THRESH_BINARY)
+
+        # 4️⃣ Limpieza morfológica
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        # 5️⃣ Aplicar máscara sobre imagen original en color
+        img_color = cv2.imread(image_path)
+        result = cv2.bitwise_and(img_color, img_color, mask=mask)
+
+        # Guardar versión limpia
+        clean_path = os.path.join(os.path.dirname(image_path),
+                                  "clean_" + os.path.basename(image_path))
+        cv2.imwrite(clean_path, result)
+
+        return clean_path
+
+    # ==============================================================
+    # 🧠 PREDICCIÓN PRINCIPAL
+    # ==============================================================
     def predict(self, image_path):
-        image = Image.open(image_path).convert('RGB')
+        # Primero limpiar la imagen
+        clean_path = self._preprocess_bones(image_path)
+
+        # Cargar imagen limpia y aplicar transformaciones
+        image = Image.open(clean_path).convert('RGB')
         input_tensor = self.transform(image).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -39,14 +78,21 @@ class FracturePipeline:
         predicted_label = self.classes[preds.item()]
         confidence = torch.nn.functional.softmax(outputs, dim=1)[0][preds.item()].item()
 
-        result = {"prediction": predicted_label, "confidence": round(confidence, 4)}
+        result = {
+            "prediction": predicted_label,
+            "confidence": round(confidence, 4),
+            "clean_image_path": clean_path
+        }
 
-        # Si hay fractura, genera mapa de calor
+        # Si está fracturada, generar Grad-CAM
         if predicted_label == "fractured":
-            result["heatmap_path"] = self._generate_heatmap(image_path, input_tensor)
+            result["heatmap_path"] = self._generate_heatmap(clean_path, input_tensor)
 
         return result
 
+    # ==============================================================
+    # 🔥 GRAD-CAM
+    # ==============================================================
     def _generate_heatmap(self, image_path, input_tensor):
         gradients = []
         activations = []
@@ -71,22 +117,3 @@ class FracturePipeline:
         grads = gradients[0].cpu().data.numpy()[0]
         acts = activations[0].cpu().data.numpy()[0]
         weights = np.mean(grads, axis=(1, 2))
-
-        cam = np.zeros(acts.shape[1:], dtype=np.float32)
-        for i, w in enumerate(weights):
-            cam += w * acts[i, :, :]
-
-        cam = np.maximum(cam, 0)
-        cam = cv2.resize(cam, (224, 224))
-        cam = cam - np.min(cam)
-        cam = cam / np.max(cam)
-
-        img = cv2.imread(image_path)
-        img = cv2.resize(img, (224, 224))
-        heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-        superimposed = np.uint8(0.4 * heatmap + 0.6 * img)
-
-        output_path = os.path.join(os.path.dirname(image_path),
-                                   "heatmap_" + os.path.basename(image_path))
-        cv2.imwrite(output_path, superimposed)
-        return output_path
